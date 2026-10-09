@@ -168,3 +168,73 @@ func TestPersistentQueueDoneIgnoresAlreadyRemovedBackupTask(t *testing.T) {
 	assert.Equal(t, 0, info.Stats.Pending)
 	assert.Equal(t, 0, info.Stats.Running)
 }
+
+// A dependency that finished before a server restart is no longer in the task
+// store, and the restored dependent task carries the empty DepStatus it was
+// inserted with. Restoring must rebuild that status from the dependency's
+// workflow, or a task whose dependency failed would run anyway.
+func TestWithTaskStoreRestoresFinishedDependencyStatus(t *testing.T) {
+	for _, tc := range []struct {
+		depState  model.StatusValue
+		shouldRun bool
+	}{
+		{model.StatusFailure, false},
+		{model.StatusKilled, false},
+		{model.StatusSuccess, true},
+	} {
+		t.Run(string(tc.depState), func(t *testing.T) {
+			ctx, cancel, q := setupTestQueue(t)
+			defer cancel(nil)
+
+			task := &model.Task{ID: "2", Data: []byte("{}"), Dependencies: []string{"1"}, DepStatus: map[string]model.StatusValue{}}
+
+			store := store_mocks.NewMockStore(t)
+			store.EXPECT().TaskList().Return([]*model.Task{task}, nil).Once()
+			store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: tc.depState}, nil).Once()
+
+			WithTaskStore(ctx, q, store)
+
+			got, err := q.Poll(ctx, 1, filterFnTrue)
+			assert.NoError(t, err)
+			assert.Equal(t, "2", got.ID)
+			assert.Equal(t, tc.depState, got.DepStatus["1"])
+			assert.Equal(t, tc.shouldRun, got.ShouldRun())
+		})
+	}
+}
+
+// A dependency that is itself restored is still queued and reports its status
+// through the queue; one whose workflow is not finished is left alone. Neither
+// may be given a status on restore.
+func TestWithTaskStoreLeavesUnfinishedDependencies(t *testing.T) {
+	ctx, cancel, q := setupTestQueue(t)
+	defer cancel(nil)
+
+	dep := &model.Task{ID: "1", Data: []byte("{}")}
+	task := &model.Task{ID: "3", Data: []byte("{}"), Dependencies: []string{"1", "2"}, DepStatus: map[string]model.StatusValue{}}
+
+	store := store_mocks.NewMockStore(t)
+	store.EXPECT().TaskList().Return([]*model.Task{dep, task}, nil).Once()
+	// "1" is restored, so it is never loaded; "2" is still running.
+	store.EXPECT().WorkflowLoad(int64(2)).Return(&model.Workflow{ID: 2, State: model.StatusRunning}, nil).Once()
+
+	WithTaskStore(ctx, q, store)
+
+	assert.Empty(t, task.DepStatus)
+}
+
+// A nil DepStatus (older rows) is initialized rather than panicking.
+func TestWithTaskStoreInitializesNilDepStatus(t *testing.T) {
+	ctx, cancel, q := setupTestQueue(t)
+	defer cancel(nil)
+
+	task := &model.Task{ID: "2", Data: []byte("{}"), Dependencies: []string{"1"}}
+
+	store := store_mocks.NewMockStore(t)
+	store.EXPECT().TaskList().Return([]*model.Task{task}, nil).Once()
+	store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: model.StatusFailure}, nil).Once()
+
+	WithTaskStore(ctx, q, store)
+
+	assert.Equal(t, model.StatusFailure, task.DepStatus["1"])
+}

@@ -32,10 +32,57 @@ import (
 // ensures the task Queue can be restored when the system starts.
 func WithTaskStore(ctx context.Context, q Queue, s store.Store) Queue {
 	tasks, _ := s.TaskList()
+	restoreDepStatus(s, tasks)
 	if err := q.PushAtOnce(ctx, tasks); err != nil {
 		log.Error().Err(err).Msg("PushAtOnce failed")
 	}
 	return &persistentQueue{q, s}
+}
+
+// restoreDepStatus rebuilds the dependency status of restored tasks.
+//
+// DepStatus is only updated in memory when a dependency finishes (see
+// fifo.updateDepStatusInQueue); the copy in the task store keeps the empty map
+// it was inserted with. Without this, a task whose dependency already finished
+// before a server restart comes back with no status for it, so ShouldRun
+// treats the dependency as passed and the task runs even if the dependency
+// failed. A dependency that is itself among the restored tasks is still
+// pending or running and reports its status through the queue as usual.
+func restoreDepStatus(s store.Store, tasks []*model.Task) {
+	restored := make(map[string]struct{}, len(tasks))
+	for _, task := range tasks {
+		restored[task.ID] = struct{}{}
+	}
+
+	for _, task := range tasks {
+		for _, dep := range task.Dependencies {
+			if _, ok := restored[dep]; ok {
+				continue
+			}
+			if _, ok := task.DepStatus[dep]; ok {
+				continue
+			}
+
+			workflowID, err := strconv.ParseInt(dep, 10, 64)
+			if err != nil {
+				log.Error().Err(err).Msgf("restore queue item: %s: invalid dependency id %q", task.ID, dep)
+				continue
+			}
+			workflow, err := s.WorkflowLoad(workflowID)
+			if err != nil {
+				log.Error().Err(err).Msgf("restore queue item: %s: failed to load dependency %s", task.ID, dep)
+				continue
+			}
+			if !isTerminalWorkflowState(workflow.State) {
+				continue
+			}
+
+			if task.DepStatus == nil {
+				task.DepStatus = make(map[string]model.StatusValue)
+			}
+			task.DepStatus[dep] = workflow.State
+		}
+	}
 }
 
 type persistentQueue struct {
